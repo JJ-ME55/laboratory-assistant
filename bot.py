@@ -1718,22 +1718,26 @@ async def cmd_liquidity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Failed to fetch liquidity data.")
         return
 
-    lines = []
+    def fmt_depth(quote: str, bal: float) -> str:
+        if quote == "USDC":
+            return f"{bal/1000:.1f}K {quote}" if bal >= 1000 else f"{bal:.0f} {quote}"
+        return f"{bal:,.1f} {quote}"   # SOL / HYPE
+
+    blocks = []
     for name, emoji in [("CRIME", "🔴"), ("FRAUD", "🔵")]:
         t = liq[name]
-        sub = [
-            f"  {pool['quote']}: <code>{pool['quote_bal']:,.3f} {pool['quote']}</code> · "
-            f"<code>{pool['base_bal']:,.0f}</code> · {fmt_usd(pool['tvl'])}"
+        rows = [
+            f"{pool['quote']:<4} {fmt_usd(pool['tvl']):>8}  {fmt_depth(pool['quote'], pool['quote_bal']):>12}"
             for pool in t["pools"]
         ]
-        lines.append(
-            f"{emoji} <b>{name}</b> — TVL <code>{fmt_usd(t['tvl'])}</code>\n"
-            + "\n".join(sub)
+        blocks.append(
+            f"{emoji} <b>{name}</b>  ·  TVL <b>{fmt_usd(t['tvl'])}</b>\n"
+            f"<pre>{chr(10).join(rows)}</pre>"
         )
 
     msg = (
         f"💧 <b>Liquidity Pools</b> <i>(all quotes · 1% LP fee)</i>\n\n"
-        + "\n\n".join(lines)
+        + "\n\n".join(blocks)
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
