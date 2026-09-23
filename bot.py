@@ -491,6 +491,33 @@ async def compute_pool_valuations() -> dict:
                  "profit": profit_max * profit_usd},
     }
 
+async def compute_pool_liquidity() -> dict:
+    """Per-pool reserves and USD TVL across ALL pools, grouped by base token.
+    Read straight from on-chain vaults so USDC and HYPE pools are included
+    (the fraudsworth.fyi /liquidity endpoint only reports the SOL pools)."""
+    vaults = []
+    for p in POOLS:
+        vaults += [p["base_vault"], p["quote_vault"]]
+    accts = await rpc_get_multiple_accounts(vaults)
+    if len(accts) != len(vaults):
+        return {}
+    amts = {}
+    for v, a in zip(vaults, accts):
+        try:
+            amts[v] = struct.unpack_from("<Q", base64.b64decode(a["data"][0]), SPL_AMOUNT_OFFSET)[0]
+        except Exception:
+            amts[v] = 0
+
+    out = {"CRIME": {"pools": [], "tvl": 0.0}, "FRAUD": {"pools": [], "tvl": 0.0}}
+    for p in POOLS:
+        bal_b = amts.get(p["base_vault"], 0) / (10 ** BASE_DECIMALS)
+        bal_q = amts.get(p["quote_vault"], 0) / (10 ** p["quote_decimals"])
+        tvl = 2 * bal_q * _quote_usd(p["quote"])
+        out[p["base"]]["pools"].append(
+            {"quote": p["quote"], "quote_bal": bal_q, "base_bal": bal_b, "tvl": tvl})
+        out[p["base"]]["tvl"] += tvl
+    return out
+
 async def update_fdv_cache():
     """Recompute CRIME/FRAUD/PROFIT market cap & FDV every 60s from live,
     all-pool on-chain prices. Falls back to the fraudsworth.fyi API only if
@@ -1686,27 +1713,26 @@ async def cmd_supply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 async def cmd_liquidity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = await fyi_get("/liquidity/current")
-    if not data:
+    liq = await compute_pool_liquidity()
+    if not liq:
         await update.message.reply_text("Failed to fetch liquidity data.")
         return
 
-    total_fee = data.get("totalFeeSol", 0)
     lines = []
-    for name, emoji in [("crime", "🔴"), ("fraud", "🔵")]:
-        p = data.get(name, {})
-        sol_bal = p.get("solHuman", 0)
-        tok_bal = p.get("tokenHuman", 0)
-        tvl = p.get("tvlUsd", 0)
+    for name, emoji in [("CRIME", "🔴"), ("FRAUD", "🔵")]:
+        t = liq[name]
+        sub = [
+            f"  {pool['quote']}: <code>{pool['quote_bal']:,.3f} {pool['quote']}</code> · "
+            f"<code>{pool['base_bal']:,.0f}</code> · {fmt_usd(pool['tvl'])}"
+            for pool in t["pools"]
+        ]
         lines.append(
-            f"{emoji} <b>{name.upper()}</b>\n"
-            f"  SOL: <code>{sol_bal:,.3f}</code>\n"
-            f"  Tokens: <code>{tok_bal:,.0f}</code>\n"
-            f"  TVL: <code>{fmt_usd(tvl)}</code>"
+            f"{emoji} <b>{name}</b> — TVL <code>{fmt_usd(t['tvl'])}</code>\n"
+            + "\n".join(sub)
         )
 
     msg = (
-        f"💧 <b>Liquidity Pools</b>\n\n"
+        f"💧 <b>Liquidity Pools</b> <i>(all quotes · 1% LP fee)</i>\n\n"
         + "\n\n".join(lines)
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
