@@ -56,6 +56,7 @@ from config import (
     EPOCH_OFFSET_FRAUD_BUY_TAX, EPOCH_OFFSET_FRAUD_SELL_TAX,
     EPOCH_OFFSET_CARNAGE_PENDING, EPOCH_OFFSET_CARNAGE_TARGET,
     POOL_OFFSET_RESERVE_A, POOL_OFFSET_RESERVE_B,
+    POOLS, BASE_DECIMALS, ARB_OPERATOR,
 )
 
 # ============================================================
@@ -75,6 +76,7 @@ log = logging.getLogger(__name__)
 # GLOBALS
 # ============================================================
 sol_price = 89.0
+hype_price = 0.0   # HYPE/USD, refreshed alongside SOL price for HYPE-pool valuation
 pending_image_updates = {}
 processed_tax_sigs = OrderedDict()
 processed_stake_sigs = OrderedDict()
@@ -101,6 +103,16 @@ def rotate_rpc_key(reason: str = ""):
     new_key = HELIUS_API_KEYS[_rpc_key_index][-8:]
     log.warning(f"RPC key rotated: ...{old_key} → ...{new_key} ({reason})")
 
+def rpc_check_http(status: int) -> bool:
+    """Check HTTP status before parsing JSON. Returns True (= should retry) on 429/500/503."""
+    global _rpc_consecutive_failures
+    if status in (429, 500, 503):
+        _rpc_consecutive_failures += 1
+        if _rpc_consecutive_failures >= 2 and len(HELIUS_API_KEYS) > 1:
+            rotate_rpc_key(f"HTTP {status}")
+        return True
+    return False
+
 def rpc_check_error(resp_json: dict) -> bool:
     """Check RPC response for rate-limit errors. Returns True if error detected and key rotated."""
     global _rpc_consecutive_failures
@@ -123,8 +135,12 @@ def rpc_check_error(resp_json: dict) -> bool:
 # Cached epoch state (updated by monitor_epochs every 60s)
 cached_epoch_state = {}
 
-# Cached FDV from fraudsworth.fyi API (updated every 60s)
+# Live valuations, recomputed every 60s from all-pool on-chain prices.
+# cached_fdv holds *market caps* (name kept for backwards compatibility);
+# cached_fdv_full holds fully-diluted valuations; cached_prices the unit prices.
 cached_fdv = {"crime": 0.0, "fraud": 0.0, "profit": 0.0}
+cached_fdv_full = {"crime": 0.0, "fraud": 0.0, "profit": 0.0}
+cached_prices = {"crime_usd": 0.0, "fraud_usd": 0.0, "profit_usd": 0.0}
 
 # Activity tracking for /health
 activity = {
@@ -215,6 +231,8 @@ async def rpc_get_account(pubkey: str, encoding: str = "base64"):
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(get_rpc_url(), json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if rpc_check_http(r.status):
+                    return None
                 resp = await r.json()
                 if rpc_check_error(resp):
                     return None
@@ -228,11 +246,43 @@ async def rpc_get_token_balance(pubkey: str) -> float:
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(get_rpc_url(), json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if rpc_check_http(r.status):
+                    return 0.0
                 resp = await r.json()
                 if rpc_check_error(resp):
                     return 0.0
                 val = resp.get("result", {}).get("value", {})
                 return float(val.get("uiAmount") or 0)
+    except Exception:
+        return 0.0
+
+async def rpc_get_multiple_accounts(pubkeys: list) -> list:
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "getMultipleAccounts",
+               "params": [pubkeys, {"encoding": "base64"}]}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(get_rpc_url(), json=payload, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if rpc_check_http(r.status):
+                    return []
+                resp = await r.json()
+                if rpc_check_error(resp):
+                    return []
+                return resp.get("result", {}).get("value", []) or []
+    except Exception as e:
+        log.warning(f"getMultipleAccounts error: {e}")
+        return []
+
+async def rpc_get_token_supply(mint: str) -> float:
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [mint]}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(get_rpc_url(), json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if rpc_check_http(r.status):
+                    return 0.0
+                resp = await r.json()
+                if rpc_check_error(resp):
+                    return 0.0
+                return float(resp.get("result", {}).get("value", {}).get("uiAmount") or 0)
     except Exception:
         return 0.0
 
@@ -246,6 +296,8 @@ async def rpc_get_transaction(sig: str):
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(get_rpc_url(), json=payload, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if rpc_check_http(r.status):
+                    return None
                 resp = await r.json()
                 if rpc_check_error(resp):
                     return None
@@ -329,37 +381,144 @@ async def estimate_tokens_from_sol(sol_amount: float, pool_state_pubkey: str, to
     return tokens_out
 
 # ============================================================
-# SOL PRICE UPDATER
+# SOL / HYPE PRICE UPDATER
 # ============================================================
 async def update_sol_price():
-    global sol_price
+    global sol_price, hype_price
     while True:
         try:
             async with aiohttp.ClientSession() as s:
                 async with s.get(
-                    "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
+                    "https://api.coingecko.com/api/v3/simple/price?ids=solana,hyperliquid&vs_currencies=usd",
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as r:
-                    sol_price = (await r.json())["solana"]["usd"]
+                    data = await r.json()
+                    sol_price = data["solana"]["usd"]
+                    hype_price = data.get("hyperliquid", {}).get("usd", hype_price)
                     activity["last_sol_price_update"] = time.time()
-                    log.info(f"SOL: ${sol_price}")
+                    log.info(f"SOL: ${sol_price} · HYPE: ${hype_price}")
         except Exception as e:
             log.warning(f"SOL price update failed: {e}")
         await asyncio.sleep(300)
 
+def quote_to_sol(quote: str, amount: float) -> float:
+    """Convert a native quote-asset amount into a SOL-equivalent value.
+    USDC is treated as USD; HYPE uses the live CoinGecko price."""
+    if quote == "SOL":
+        return amount
+    if sol_price <= 0:
+        return 0.0
+    if quote == "USDC":
+        return amount / sol_price
+    if quote == "HYPE":
+        return amount * hype_price / sol_price
+    return 0.0
+
+def fmt_trade_size(quote: str, quote_amount: float, sol_equiv: float) -> str:
+    """Header display for a trade. SOL pools read exactly as before;
+    USDC/HYPE pools show the native amount plus the SOL-equivalent."""
+    if quote == "SOL":
+        return fmt_sol(sol_equiv)
+    return f"{quote_amount:,.2f} {quote} (≈{sol_equiv:.3f} SOL)"
+
+# Each PROFIT represents (CRIME_supply / PROFIT_supply) CRIME + the same in
+# FRAUD, so PROFIT price = ratio × (CRIME price + FRAUD price). Verified exact
+# against the site's own figures. Ratio = 1B / 20M = 50.
+PROFIT_RATIO = TOTAL_SUPPLY / PROFIT_SUPPLY
+SPL_AMOUNT_OFFSET = 64  # u64 token amount inside an SPL token account
+
+def _quote_usd(quote: str) -> float:
+    return {"SOL": sol_price, "USDC": 1.0, "HYPE": hype_price}.get(quote, 0.0)
+
+async def compute_pool_valuations() -> dict:
+    """Liquidity-weighted CRIME/FRAUD prices across ALL pools (SOL, USDC, HYPE),
+    read straight from on-chain vault balances, plus the derived PROFIT
+    valuation. This replaces the single-pool API price that made mcap look off
+    once the factory went multi-pool. Returns {} if the on-chain read fails."""
+    vaults = []
+    for p in POOLS:
+        vaults += [p["base_vault"], p["quote_vault"]]
+    accts = await rpc_get_multiple_accounts(vaults)
+    if len(accts) != len(vaults):
+        return {}
+    amts = {}
+    for v, a in zip(vaults, accts):
+        try:
+            amts[v] = struct.unpack_from("<Q", base64.b64decode(a["data"][0]), SPL_AMOUNT_OFFSET)[0]
+        except Exception:
+            amts[v] = 0
+
+    num = {"CRIME": 0.0, "FRAUD": 0.0}
+    den = {"CRIME": 0.0, "FRAUD": 0.0}
+    for p in POOLS:
+        bal_b = amts.get(p["base_vault"], 0) / (10 ** BASE_DECIMALS)
+        bal_q = amts.get(p["quote_vault"], 0) / (10 ** p["quote_decimals"])
+        qusd = _quote_usd(p["quote"])
+        if bal_b <= 0 or bal_q <= 0 or qusd <= 0:
+            continue
+        price = (bal_q * qusd) / bal_b          # base price in USD, this pool
+        liq = 2 * bal_q * qusd                   # pool liquidity in USD (both sides)
+        num[p["base"]] += price * liq
+        den[p["base"]] += liq
+
+    if den["CRIME"] <= 0 or den["FRAUD"] <= 0:
+        return {}
+    crime_usd = num["CRIME"] / den["CRIME"]
+    fraud_usd = num["FRAUD"] / den["FRAUD"]
+    profit_usd = PROFIT_RATIO * (crime_usd + fraud_usd)
+
+    # CRIME/FRAUD market cap uses live mint supply (genesis − burned), read
+    # on-chain; FDV uses the fixed genesis supply.
+    crime_circ = await rpc_get_token_supply(CRIME_MINT) or TOTAL_SUPPLY
+    fraud_circ = await rpc_get_token_supply(FRAUD_MINT) or TOTAL_SUPPLY
+
+    # PROFIT circulating / max depend on off-chain vault + foundation balances,
+    # so the supply API remains the source for those (the *price* was the weak
+    # link, and that's now local). Falls back to the fixed supply if unavailable.
+    profit_circ = profit_max = PROFIT_SUPPLY
+    sup = await fyi_get("/supply/current")
+    if sup and sup.get("profit"):
+        profit_circ = sup["profit"].get("circulating", PROFIT_SUPPLY)
+        profit_max = sup["profit"].get("maxCirculating", PROFIT_SUPPLY)
+
+    return {
+        "prices": {"crime_usd": crime_usd, "fraud_usd": fraud_usd, "profit_usd": profit_usd},
+        "mcap": {"crime": crime_circ * crime_usd,
+                 "fraud": fraud_circ * fraud_usd,
+                 "profit": profit_circ * profit_usd},
+        "fdv":  {"crime": TOTAL_SUPPLY * crime_usd,
+                 "fraud": TOTAL_SUPPLY * fraud_usd,
+                 "profit": profit_max * profit_usd},
+    }
+
 async def update_fdv_cache():
-    """Fetch FDV from fraudsworth.fyi API every 60s."""
-    global cached_fdv
+    """Recompute CRIME/FRAUD/PROFIT market cap & FDV every 60s from live,
+    all-pool on-chain prices. Falls back to the fraudsworth.fyi API only if
+    the on-chain read fails."""
+    global cached_fdv, cached_fdv_full, cached_prices
     while True:
         try:
-            data = await fyi_get("/solana/pool-state")
-            if data:
-                cached_fdv = {
-                    "crime": data.get("crime", {}).get("marketCapUsd", 0.0),
-                    "fraud": data.get("fraud", {}).get("marketCapUsd", 0.0),
-                    "profit": data.get("profit", {}).get("marketCapUsd", 0.0),
-                }
-                log.info(f"FDV cache: CRIME={cached_fdv['crime']:.0f} FRAUD={cached_fdv['fraud']:.0f}")
+            v = await compute_pool_valuations()
+            if v:
+                cached_fdv = v["mcap"]
+                cached_fdv_full = v["fdv"]
+                cached_prices = v["prices"]
+                log.info(f"Valuation: CRIME mc={cached_fdv['crime']:.0f}/fdv={cached_fdv_full['crime']:.0f} "
+                         f"FRAUD mc={cached_fdv['fraud']:.0f} PROFIT mc={cached_fdv['profit']:.0f}")
+            else:
+                data = await fyi_get("/solana/pool-state")
+                if data:
+                    cached_fdv = {
+                        "crime": data.get("crime", {}).get("marketCapUsd", 0.0),
+                        "fraud": data.get("fraud", {}).get("marketCapUsd", 0.0),
+                        "profit": data.get("profit", {}).get("marketCapUsd", 0.0),
+                    }
+                    cached_fdv_full = {
+                        "crime": cached_fdv["crime"],
+                        "fraud": cached_fdv["fraud"],
+                        "profit": data.get("profit", {}).get("fdvUsd", cached_fdv["profit"]),
+                    }
+                    log.warning("Valuation: on-chain read failed — used API fallback")
         except Exception as e:
             log.warning(f"FDV cache update failed: {e}")
         await asyncio.sleep(60)
@@ -413,12 +572,15 @@ async def send_alert(bot: Bot, message: str, event_type: str = None,
 # ============================================================
 # ALERT BUILDERS — v6 templates
 # ============================================================
-async def fire_crime_buy(bot: Bot, sol: float, tokens: float, fdv: float, sig: str):
+async def fire_crime_buy(bot: Bot, sol: float, tokens: float, mcap: float, sig: str,
+                         quote: str = "SOL", quote_amount: float = 0.0, fdv: float = 0.0):
     if not db.get_setting("alerts_crime_buys"):
         return
 
     tier = get_buy_tier(sol)
     tx_url = solscan_tx(sig)
+    size_disp = fmt_trade_size(quote, quote_amount, sol)
+    pool_line = "" if quote == "SOL" else f"  <i>via {quote} pool</i>\n"
 
     # Read fresh epoch state for accurate tax rate
     epoch = await fetch_epoch_state() or cached_epoch_state
@@ -430,9 +592,10 @@ async def fire_crime_buy(bot: Bot, sol: float, tokens: float, fdv: float, sig: s
         msg = (
             f"💥 <b>THE LABORATORY SHAKES</b>\n\n"
             f"🏦🏦🏦🏦🏦\n"
-            f"<b>CRIME — {fmt_sol(sol)}</b>\n"
+            f"<b>CRIME — {size_disp}</b>\n"
             f"  <code>{tokens:,.0f} CRIME</code> ABSORBED\n"
-            f"  FDV <code>{fmt_usd(fdv)}</code>\n"
+            f"{pool_line}"
+            f"  MC <code>{fmt_usd(mcap)}</code> · FDV <code>{fmt_usd(fdv)}</code>\n"
             f"  Tax <code>{tax_pct}</code> · <code>{stakers_sol:.4f} SOL</code> EXTRACTED\n\n"
             f"<i>SOMEBODY SEDATE THE DOCTOR.</i>\n"
             f"<i>HE HAS TAKEN LEAVE OF HIS SENSES.</i>\n\n"
@@ -442,9 +605,10 @@ async def fire_crime_buy(bot: Bot, sol: float, tokens: float, fdv: float, sig: s
         msg = (
             f"⚡ <b>SIGNIFICANT EXPERIMENT DETECTED</b>\n\n"
             f"🏦🏦🏦\n"
-            f"<b>CRIME — {fmt_sol(sol)}</b>\n"
+            f"<b>CRIME — {size_disp}</b>\n"
             f"  <code>{tokens:,.0f} CRIME</code> SEIZED\n"
-            f"  FDV <code>{fmt_usd(fdv)}</code>\n"
+            f"{pool_line}"
+            f"  MC <code>{fmt_usd(mcap)}</code> · FDV <code>{fmt_usd(fdv)}</code>\n"
             f"  Tax <code>{tax_pct}</code> · <code>{stakers_sol:.4f} SOL</code> extracted for stakers\n\n"
             f"<i>THE DOCTOR CANNOT CONTAIN HIMSELF.</i>\n\n"
             f"<a href='{tx_url}'>📋 Txn</a> · <a href='https://fraudsworth.fun'>Buy CRIME</a>"
@@ -453,9 +617,10 @@ async def fire_crime_buy(bot: Bot, sol: float, tokens: float, fdv: float, sig: s
         msg = (
             f"🧪 <b>The laboratory stirs...</b>\n\n"
             f"💰💰💰\n"
-            f"<b>CRIME</b> — <code>{fmt_sol(sol)}</code>\n"
+            f"<b>CRIME</b> — <code>{size_disp}</code>\n"
             f"  <code>{tokens:,.0f} CRIME</code> consumed\n"
-            f"  FDV <code>{fmt_usd(fdv)}</code>\n"
+            f"{pool_line}"
+            f"  MC <code>{fmt_usd(mcap)}</code> · FDV <code>{fmt_usd(fdv)}</code>\n"
             f"  Tax <code>{tax_pct}</code> · <code>{stakers_sol:.4f} SOL</code> to stakers\n\n"
             f"<i>The Doctor cannot contain himself.</i>\n\n"
             f"<a href='{tx_url}'>📋 Txn</a> · <a href='https://fraudsworth.fun'>Buy CRIME</a>"
@@ -464,9 +629,10 @@ async def fire_crime_buy(bot: Bot, sol: float, tokens: float, fdv: float, sig: s
         msg = (
             f"⚗️ <b>A new experiment begins...</b>\n\n"
             f"💵💵💵\n"
-            f"<b>CRIME</b> — <code>{fmt_sol(sol)}</code>\n"
+            f"<b>CRIME</b> — <code>{size_disp}</code>\n"
             f"  <code>{tokens:,.0f} CRIME</code> devoured\n"
-            f"  FDV <code>{fmt_usd(fdv)}</code>\n"
+            f"{pool_line}"
+            f"  MC <code>{fmt_usd(mcap)}</code> · FDV <code>{fmt_usd(fdv)}</code>\n"
             f"  Tax <code>{tax_pct}</code> · <code>{stakers_sol:.4f} SOL</code> to stakers\n\n"
             f"<i>Another soul enters the laboratory.</i>\n\n"
             f"<a href='{tx_url}'>📋 Txn</a> · <a href='https://fraudsworth.fun'>Buy CRIME</a>"
@@ -474,12 +640,15 @@ async def fire_crime_buy(bot: Bot, sol: float, tokens: float, fdv: float, sig: s
 
     await send_alert(bot, msg, "crime_buy", sol)
 
-async def fire_fraud_buy(bot: Bot, sol: float, tokens: float, fdv: float, sig: str):
+async def fire_fraud_buy(bot: Bot, sol: float, tokens: float, mcap: float, sig: str,
+                         quote: str = "SOL", quote_amount: float = 0.0, fdv: float = 0.0):
     if not db.get_setting("alerts_fraud_buys"):
         return
 
     tier = get_buy_tier(sol)
     tx_url = solscan_tx(sig)
+    size_disp = fmt_trade_size(quote, quote_amount, sol)
+    pool_line = "" if quote == "SOL" else f"  <i>via {quote} pool</i>\n"
 
     # Read fresh epoch state for accurate tax rate
     epoch = await fetch_epoch_state() or cached_epoch_state
@@ -491,9 +660,10 @@ async def fire_fraud_buy(bot: Bot, sol: float, tokens: float, fdv: float, sig: s
         msg = (
             f"💥 <b>THE LABORATORY IS ON FIRE</b>\n\n"
             f"🏦🏦🏦🏦🏦\n"
-            f"<b>FRAUD — {fmt_sol(sol)}</b>\n"
+            f"<b>FRAUD — {size_disp}</b>\n"
             f"  <code>{tokens:,.0f} FRAUD</code> ABSORBED\n"
-            f"  FDV <code>{fmt_usd(fdv)}</code>\n"
+            f"{pool_line}"
+            f"  MC <code>{fmt_usd(mcap)}</code> · FDV <code>{fmt_usd(fdv)}</code>\n"
             f"  Tax <code>{tax_pct}</code> · <code>{stakers_sol:.4f} SOL</code> EXTRACTED\n\n"
             f"<i>THE DOCTOR REQUIRES SMELLING SALTS.</i>\n"
             f"<i>FRAUD POOL WILL NEVER BE THE SAME.</i>\n\n"
@@ -503,9 +673,10 @@ async def fire_fraud_buy(bot: Bot, sol: float, tokens: float, fdv: float, sig: s
         msg = (
             f"⚡ <b>THE OTHER SIDE AWAKENS</b>\n\n"
             f"🏦🏦🏦\n"
-            f"<b>FRAUD — {fmt_sol(sol)}</b>\n"
+            f"<b>FRAUD — {size_disp}</b>\n"
             f"  <code>{tokens:,.0f} FRAUD</code> SEIZED\n"
-            f"  FDV <code>{fmt_usd(fdv)}</code>\n"
+            f"{pool_line}"
+            f"  MC <code>{fmt_usd(mcap)}</code> · FDV <code>{fmt_usd(fdv)}</code>\n"
             f"  Tax <code>{tax_pct}</code> · <code>{stakers_sol:.4f} SOL</code> extracted for stakers\n\n"
             f"<i>THE DOCTOR RECALIBRATES FRANTICALLY.</i>\n\n"
             f"<a href='{tx_url}'>📋 Txn</a> · <a href='https://fraudsworth.fun'>Buy FRAUD</a>"
@@ -514,9 +685,10 @@ async def fire_fraud_buy(bot: Bot, sol: float, tokens: float, fdv: float, sig: s
         msg = (
             f"🧪 <b>The other side stirs...</b>\n\n"
             f"💰💰💰\n"
-            f"<b>FRAUD</b> — <code>{fmt_sol(sol)}</code>\n"
+            f"<b>FRAUD</b> — <code>{size_disp}</code>\n"
             f"  <code>{tokens:,.0f} FRAUD</code> consumed\n"
-            f"  FDV <code>{fmt_usd(fdv)}</code>\n"
+            f"{pool_line}"
+            f"  MC <code>{fmt_usd(mcap)}</code> · FDV <code>{fmt_usd(fdv)}</code>\n"
             f"  Tax <code>{tax_pct}</code> · <code>{stakers_sol:.4f} SOL</code> to stakers\n\n"
             f"<i>The Doctor cross-references his notes.</i>\n\n"
             f"<a href='{tx_url}'>📋 Txn</a> · <a href='https://fraudsworth.fun'>Buy FRAUD</a>"
@@ -525,9 +697,10 @@ async def fire_fraud_buy(bot: Bot, sol: float, tokens: float, fdv: float, sig: s
         msg = (
             f"⚗️ <b>The coin flips...</b>\n\n"
             f"💵💵💵\n"
-            f"<b>FRAUD</b> — <code>{fmt_sol(sol)}</code>\n"
+            f"<b>FRAUD</b> — <code>{size_disp}</code>\n"
             f"  <code>{tokens:,.0f} FRAUD</code> absorbed\n"
-            f"  FDV <code>{fmt_usd(fdv)}</code>\n"
+            f"{pool_line}"
+            f"  MC <code>{fmt_usd(mcap)}</code> · FDV <code>{fmt_usd(fdv)}</code>\n"
             f"  Tax <code>{tax_pct}</code> · <code>{stakers_sol:.4f} SOL</code> to stakers\n\n"
             f"<i>The other side of the coin turns.</i>\n\n"
             f"<a href='{tx_url}'>📋 Txn</a> · <a href='https://fraudsworth.fun'>Buy FRAUD</a>"
@@ -535,16 +708,20 @@ async def fire_fraud_buy(bot: Bot, sol: float, tokens: float, fdv: float, sig: s
 
     await send_alert(bot, msg, "fraud_buy", sol)
 
-async def fire_big_sell(bot: Bot, sol: float, tokens: float, token_name: str, tax_sol: float, sig: str):
+async def fire_big_sell(bot: Bot, sol: float, tokens: float, token_name: str, tax_sol: float, sig: str,
+                        quote: str = "SOL", quote_amount: float = 0.0):
     if not db.get_setting("alerts_sells"):
         return
 
     tx_url = solscan_tx(sig)
+    exit_disp = fmt_trade_size(quote, quote_amount, sol)
+    pool_line = "" if quote == "SOL" else f"  <i>via {quote} pool</i>\n"
 
     msg = (
         f"💀 <b>SELL DETECTED</b>\n\n"
         f"  <code>{tokens:,.0f} {token_name}</code> abandoned\n"
-        f"  <code>{sol:.3f} SOL</code> exits the building\n"
+        f"  <code>{exit_disp}</code> exits the building\n"
+        f"{pool_line}"
         f"  <b><code>{tax_sol:.4f} SOL</code> TAXED. GONE. OURS.</b>\n\n"
         f"<i>71% to stakers · 24% to Carnage · 5% treasury</i>\n"
         f"<i>THANKS FOR THE TAXES. 🖕🖕</i>\n\n"
@@ -724,93 +901,80 @@ async def parse_and_dispatch(bot: Bot, sig: str, logs: list):
                     log.info(f"Carnage vault tx below threshold: {sol_spent:.4f} SOL sig={sig[:20]}")
                     return
 
-        # CRIME BUY — wSOL flowing into CRIME wSOL vault
-        if CRIME_WSOL_VAULT in account_keys:
-            idx = account_keys.index(CRIME_WSOL_VAULT)
-            if idx < len(pre_balances) and idx < len(post_balances):
-                diff_sol = (post_balances[idx] - pre_balances[idx]) / 1e9
-                min_sol = db.get_setting("min_buy_sol")
-                if diff_sol >= min_sol:
-                    tokens = 0
-                    for b in post_token:
-                        if b.get("mint") == CRIME_MINT:
-                            pre = float(next(
-                                (p["uiTokenAmount"]["uiAmount"] for p in pre_token
-                                 if p.get("accountIndex") == b["accountIndex"]), 0) or 0)
-                            post_val = float(b["uiTokenAmount"]["uiAmount"] or 0)
-                            change = post_val - pre
-                            if change > tokens:
-                                tokens = change
-                    fdv = cached_fdv["crime"]
-                    log.info(f"CRIME buy: {diff_sol:.4f} SOL → {tokens:,.0f} tokens FDV {fmt_usd(fdv)} sig={sig[:20]}")
-                    await fire_crime_buy(bot, diff_sol, tokens, fdv, sig)
-                    return
+        # Skip the in-house arb operator — its multi-pool rotations are
+        # protocol rebalancing, not organic buys/sells. (Carnage above is
+        # unaffected; it fires from the carnage vault, not the arb wallet.)
+        if fee_payer == ARB_OPERATOR:
+            return
 
-                # CRIME SELL — SOL flowing OUT of CRIME wSOL vault
-                elif diff_sol < 0:
-                    sell_sol = abs(diff_sol)
-                    sell_tax_bps = cached_epoch_state.get("crime_sell_bps", 0)
-                    tax_extracted = sell_sol * sell_tax_bps / 10000
-                    min_sell_tax = db.get_setting("min_sell_tax_sol")
-                    if min_sell_tax is not None and tax_extracted >= min_sell_tax:
-                        tokens = 0
-                        for b in pre_token:
-                            if b.get("mint") == CRIME_MINT:
-                                post_b = next(
-                                    (p for p in post_token
-                                     if p.get("accountIndex") == b["accountIndex"]), None)
-                                pre_val = float(b["uiTokenAmount"]["uiAmount"] or 0)
-                                post_val = float(post_b["uiTokenAmount"]["uiAmount"] or 0) if post_b else 0
-                                change = pre_val - post_val
-                                if change > tokens:
-                                    tokens = change
-                        log.info(f"CRIME sell: {sell_sol:.4f} SOL, tax {tax_extracted:.4f} SOL sig={sig[:20]}")
-                        await fire_big_sell(bot, sell_sol, tokens, "CRIME", tax_extracted, sig)
-                        return
+        # ── MULTI-POOL BUY / SELL DETECTION ──────────────────────────
+        # The factory is multi-pool: CRIME/FRAUD each trade against SOL,
+        # USDC and HYPE. Every taxed swap routes through the tax program,
+        # but a trade is only visible in *its own* pool's vault balances,
+        # so we scan every pool via token-balance deltas on the base and
+        # quote vaults. A genuine swap moves base and quote in OPPOSITE
+        # directions; matching signs mean a liquidity deposit/withdrawal,
+        # which we skip. One tx can touch several pools (arb); we fire on
+        # the single largest leg to preserve one-alert-per-tx behaviour.
+        def vault_delta(vault: str, decimals: int):
+            if vault not in account_keys:
+                return None
+            idx = account_keys.index(vault)
+            pre_raw = next((int(b["uiTokenAmount"]["amount"]) for b in pre_token
+                            if b.get("accountIndex") == idx), 0)
+            post_raw = next((int(b["uiTokenAmount"]["amount"]) for b in post_token
+                             if b.get("accountIndex") == idx), 0)
+            return (post_raw - pre_raw) / (10 ** decimals)
 
-        # FRAUD BUY — wSOL flowing into FRAUD wSOL vault
-        if FRAUD_WSOL_VAULT in account_keys:
-            idx = account_keys.index(FRAUD_WSOL_VAULT)
-            if idx < len(pre_balances) and idx < len(post_balances):
-                diff_sol = (post_balances[idx] - pre_balances[idx]) / 1e9
-                min_sol = db.get_setting("min_buy_sol")
-                if diff_sol >= min_sol:
-                    tokens = 0
-                    for b in post_token:
-                        if b.get("mint") == FRAUD_MINT:
-                            pre = float(next(
-                                (p["uiTokenAmount"]["uiAmount"] for p in pre_token
-                                 if p.get("accountIndex") == b["accountIndex"]), 0) or 0)
-                            post_val = float(b["uiTokenAmount"]["uiAmount"] or 0)
-                            change = post_val - pre
-                            if change > tokens:
-                                tokens = change
-                    fdv = cached_fdv["fraud"]
-                    log.info(f"FRAUD buy: {diff_sol:.4f} SOL → {tokens:,.0f} tokens FDV {fmt_usd(fdv)} sig={sig[:20]}")
-                    await fire_fraud_buy(bot, diff_sol, tokens, fdv, sig)
-                    return
+        best = None
+        for pool in POOLS:
+            q_diff = vault_delta(pool["quote_vault"], pool["quote_decimals"])
+            b_diff = vault_delta(pool["base_vault"], BASE_DECIMALS)
+            if q_diff is None or b_diff is None:
+                continue
+            if q_diff > 0 and b_diff < 0:
+                direction, quote_amt, token_amt = "buy", q_diff, -b_diff
+            elif q_diff < 0 and b_diff > 0:
+                direction, quote_amt, token_amt = "sell", -q_diff, b_diff
+            else:
+                continue  # same-sign both vaults = liquidity event, not a trade
+            sol_equiv = quote_to_sol(pool["quote"], quote_amt)
+            if best is None or sol_equiv > best["sol_equiv"]:
+                best = {"pool": pool, "direction": direction,
+                        "quote_amt": quote_amt, "token_amt": token_amt,
+                        "sol_equiv": sol_equiv}
 
-                # FRAUD SELL — SOL flowing OUT of FRAUD wSOL vault
-                elif diff_sol < 0:
-                    sell_sol = abs(diff_sol)
-                    sell_tax_bps = cached_epoch_state.get("fraud_sell_bps", 0)
-                    tax_extracted = sell_sol * sell_tax_bps / 10000
-                    min_sell_tax = db.get_setting("min_sell_tax_sol")
-                    if min_sell_tax is not None and tax_extracted >= min_sell_tax:
-                        tokens = 0
-                        for b in pre_token:
-                            if b.get("mint") == FRAUD_MINT:
-                                post_b = next(
-                                    (p for p in post_token
-                                     if p.get("accountIndex") == b["accountIndex"]), None)
-                                pre_val = float(b["uiTokenAmount"]["uiAmount"] or 0)
-                                post_val = float(post_b["uiTokenAmount"]["uiAmount"] or 0) if post_b else 0
-                                change = pre_val - post_val
-                                if change > tokens:
-                                    tokens = change
-                        log.info(f"FRAUD sell: {sell_sol:.4f} SOL, tax {tax_extracted:.4f} SOL sig={sig[:20]}")
-                        await fire_big_sell(bot, sell_sol, tokens, "FRAUD", tax_extracted, sig)
-                        return
+        if not best:
+            return
+
+        pool      = best["pool"]
+        base      = pool["base"]        # "CRIME" | "FRAUD"
+        quote     = pool["quote"]       # "SOL" | "USDC" | "HYPE"
+        sol_equiv = best["sol_equiv"]
+        tokens    = best["token_amt"]
+
+        if best["direction"] == "buy":
+            min_sol = db.get_setting("min_buy_sol")
+            if sol_equiv < min_sol:
+                return
+            mcap = cached_fdv["crime"] if base == "CRIME" else cached_fdv["fraud"]
+            fdv  = cached_fdv_full["crime"] if base == "CRIME" else cached_fdv_full["fraud"]
+            log.info(f"{base} buy [{pool['label']}]: {best['quote_amt']:.4f} {quote} "
+                     f"(≈{sol_equiv:.4f} SOL) → {tokens:,.0f} tokens sig={sig[:20]}")
+            fire = fire_crime_buy if base == "CRIME" else fire_fraud_buy
+            await fire(bot, sol_equiv, tokens, mcap, sig, quote, best["quote_amt"], fdv)
+            return
+        else:  # sell
+            sell_bps = cached_epoch_state.get(
+                "crime_sell_bps" if base == "CRIME" else "fraud_sell_bps", 0)
+            tax_extracted = sol_equiv * sell_bps / 10000
+            min_sell_tax = db.get_setting("min_sell_tax_sol")
+            if min_sell_tax is not None and tax_extracted >= min_sell_tax:
+                log.info(f"{base} sell [{pool['label']}]: {best['quote_amt']:.4f} {quote} "
+                         f"(≈{sol_equiv:.4f} SOL), tax {tax_extracted:.4f} SOL sig={sig[:20]}")
+                await fire_big_sell(bot, sol_equiv, tokens, base, tax_extracted, sig,
+                                    quote, best["quote_amt"])
+            return
 
     except Exception as e:
         log.error(f"parse_and_dispatch error for {sig[:20]}: {e}\n{traceback.format_exc()}")
@@ -1014,6 +1178,8 @@ async def rpc_get_signatures(program_id: str, limit: int = 10, until: str = None
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(get_rpc_url(), json=payload, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if rpc_check_http(r.status):
+                    return []
                 resp = await r.json()
                 if rpc_check_error(resp):
                     return []
@@ -1253,23 +1419,21 @@ async def cmd_epoch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Fetch fresh data from fraudsworth.fyi API
-    data = await fyi_get("/solana/pool-state")
-    if data:
-        crime_fdv = data.get("crime", {}).get("marketCapUsd", 0.0)
-        fraud_fdv = data.get("fraud", {}).get("marketCapUsd", 0.0)
-        profit_mcap = data.get("profit", {}).get("marketCapUsd", 0.0)
-    else:
-        crime_fdv = cached_fdv["crime"]
-        fraud_fdv = cached_fdv["fraud"]
-        profit_mcap = cached_fdv["profit"]
+    # Recompute live from all pools; fall back to the last cached valuation.
+    v = await compute_pool_valuations()
+    mcap = v["mcap"] if v else cached_fdv
+    fdv = v["fdv"] if v else cached_fdv_full
 
-    profit_line = f"\n🟢 PROFIT Mcap: <code>{fmt_usd(profit_mcap)}</code>" if profit_mcap else ""
+    profit_line = (
+        f"\n🟢 PROFIT  MC <code>{fmt_usd(mcap['profit'])}</code> · "
+        f"FDV <code>{fmt_usd(fdv['profit'])}</code>"
+        if mcap.get("profit") else ""
+    )
 
     msg = (
-        f"💹 <b>Live Prices</b>\n\n"
-        f"🔴 CRIME FDV: <code>{fmt_usd(crime_fdv)}</code>\n"
-        f"🔵 FRAUD FDV: <code>{fmt_usd(fraud_fdv)}</code>"
+        f"💹 <b>Live Prices</b> <i>(all pools)</i>\n\n"
+        f"🔴 CRIME  MC <code>{fmt_usd(mcap['crime'])}</code> · FDV <code>{fmt_usd(fdv['crime'])}</code>\n"
+        f"🔵 FRAUD  MC <code>{fmt_usd(mcap['fraud'])}</code> · FDV <code>{fmt_usd(fdv['fraud'])}</code>"
         f"{profit_line}\n"
         f"💎 SOL: <code>${sol_price:.2f}</code>"
     )

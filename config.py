@@ -60,6 +60,63 @@ CRIME_POOL_STATE = "ZWUZ3PzGk6bg6g3BS3WdXKbdAecUgZxnruKXQkte7wf"
 FRAUD_POOL_STATE = "AngvViTVGd2zxP8KoFUjGU3TyrQjqeM1idRWiKM8p3mq"
 
 # ============================================================
+# MULTI-POOL REGISTRY
+# The factory is now multi-pool: CRIME and FRAUD each trade against
+# SOL, USDC and HYPE. Every taxed swap still routes through TAX_PROGRAM
+# (so the existing poller catches them), but a trade is only visible in
+# the balance diffs of *that pool's* vaults. Detection therefore has to
+# iterate every pool rather than watching the SOL vaults alone.
+#
+# Vault addresses were read on-chain from each AMM pool-state account
+# (layout: mint0@9, mint1@41, vault0@73, vault1@105, reserve0@137, reserve1@145).
+# base = CRIME|FRAUD, quote = SOL|USDC|HYPE.
+# ============================================================
+HYPE_MINT = "98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+
+BASE_DECIMALS = 6  # CRIME and FRAUD both use 6 decimals
+
+# In-house arbitrage operator. It rotates value across every pool
+# constantly; its swaps are protocol rebalancing, not organic demand,
+# so buy/sell alerts skip any transaction it pays for. Update if the
+# operator wallet ever changes.
+ARB_OPERATOR = "Ajob5rgrc6WTn7rGgVtz415KcTvfvdsScths2mbDwCAL"
+
+POOLS = [
+    {"label": "CRIME/SOL",  "base": "CRIME", "quote": "SOL",
+     "pool_state": CRIME_POOL_STATE,
+     "base_vault":  "6s6cprCGxTAYCk9LiwCpCsdHzReW7CLZKqy3ZSCtmV1b",
+     "quote_vault": "14rFLiXzXk7aXLnwAz2kwQUjG9vauS84AQLu6LH9idUM",
+     "quote_decimals": 9},
+    {"label": "FRAUD/SOL",  "base": "FRAUD", "quote": "SOL",
+     "pool_state": FRAUD_POOL_STATE,
+     "base_vault":  "2nzqXn6FivXjPSgrUGTA58eeVUDjGhvn4QLfhXK1jbjP",
+     "quote_vault": "3sUDyw1k61NSKgn2EA9CaS3FbSZAApGeCRNwNFQPwg8o",
+     "quote_decimals": 9},
+    {"label": "CRIME/USDC", "base": "CRIME", "quote": "USDC",
+     "pool_state": "HyJReAfMzABjEgZQNLrkdSR4pD5P78G5ucEXWRoVDNUa",
+     "base_vault":  "6xktNabGR4S1aEZikpZzTQu3EZ1aL2zTSNTmzzihbcyA",
+     "quote_vault": "HwXRHmEsLNs6ur5p3wGEjvZUctfRXDqAe3dWEb6ptLdU",
+     "quote_decimals": 6},
+    {"label": "FRAUD/USDC", "base": "FRAUD", "quote": "USDC",
+     "pool_state": "ETtBco8RUWNaNE9YozMg2KrpbJN7oqCjdd94QgwsAgzB",
+     "base_vault":  "ERiBQZ8h3FzJz7tmWcmovDxRRCHgo6hCVzAkqHxYMx68",
+     "quote_vault": "4w4oJcSxUgRRffzzy9riiDrBF8XJGcSwd163G8BYDoAp",
+     "quote_decimals": 6},
+    {"label": "CRIME/HYPE", "base": "CRIME", "quote": "HYPE",
+     "pool_state": "HummhRt6eZLVDRT3NNCRgTs3Mouje4EypQvQbXKD5Mvy",
+     "base_vault":  "DLqAEadCWzzGVE9R9Zj4oS1zQsCy9gx98MhBrX1Gj3nY",
+     "quote_vault": "BKGW4D23ruoqfhdmNSdH5vGds7BMb4vuXmKk7GLHmRr2",
+     "quote_decimals": 9},
+    {"label": "FRAUD/HYPE", "base": "FRAUD", "quote": "HYPE",
+     "pool_state": "2EVKU8ZmuZRXc6baRUHZVUjry1AaBJ9mwDgUJDZxrDGz",
+     "base_vault":  "CLdfbnfZyg2GBj3uyCALVVfjBhYZaF6WaQCGsfBSPzxh",
+     "quote_vault": "FP2P3t22xpQSG5rif11zJHQnWo3x9AkmvzNjJUEdB1sw",
+     "quote_decimals": 9},
+]
+
+# ============================================================
 # KEY ACCOUNTS
 # ============================================================
 CARNAGE_VAULT    = "5988CYMcvJpNtGbtCDnAMxrjrLxRCq3qPME7w2v36aNT"
