@@ -496,6 +496,12 @@ async def update_fdv_cache():
     all-pool on-chain prices. Falls back to the fraudsworth.fyi API only if
     the on-chain read fails."""
     global cached_fdv, cached_fdv_full, cached_prices
+    # Wait for the first real SOL/HYPE price before valuing anything, otherwise
+    # the first cycle would price the SOL/HYPE pools off the default placeholder.
+    for _ in range(30):
+        if activity.get("last_sol_price_update"):
+            break
+        await asyncio.sleep(0.5)
     while True:
         try:
             v = await compute_pool_valuations()
