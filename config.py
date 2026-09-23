@@ -18,7 +18,7 @@ TEST_CHAT_ID = int(os.environ["TEST_CHAT_ID"])
 LIVE_CHAT_ID = int(os.environ["LIVE_CHAT_ID"])
 
 # Currently active group — use /setchat live when ready
-ACTIVE_CHAT_ID = TEST_CHAT_ID
+ACTIVE_CHAT_ID = LIVE_CHAT_ID
 
 # Solana RPC — Helius keys (dual-key failover)
 HELIUS_API_KEYS = [
